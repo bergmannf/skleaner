@@ -3,22 +3,21 @@
  */
 package com.suse.skleaner
 
-import org.openstack4j.api.OSClient
-import org.openstack4j.openstack.OSFactory
-import org.openstack4j.model.common.Identifier
-import org.openstack4j.model.network.ext.LbPoolV2
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.parameters.arguments.argument
-import org.openstack4j.api.Builders
+import com.github.ajalt.clikt.parameters.options.flag
+import com.github.ajalt.clikt.parameters.options.option
+import org.openstack4j.api.OSClient
 import org.openstack4j.model.common.ActionResponse
+import org.openstack4j.model.common.Identifier
 import org.openstack4j.model.network.Network
 import org.openstack4j.model.network.Port
 import org.openstack4j.model.network.Subnet
 import org.openstack4j.model.network.ext.HealthMonitorV2
+import org.openstack4j.model.network.ext.LbPoolV2
 import org.openstack4j.model.network.ext.ListenerV2
 import org.openstack4j.model.network.ext.LoadBalancerV2
-import org.openstack4j.openstack.networking.domain.ext.ListItem
-import java.util.function.Function
+import org.openstack4j.openstack.OSFactory
 
 data class Configuration(val authUrl: String, val username: String, val password: String, val project: String, val domain: String) {
     companion object {
@@ -30,6 +29,166 @@ data class Configuration(val authUrl: String, val username: String, val password
             val domain = System.getenv("OS_USER_DOMAIN_NAME")
             return Configuration(authUrl, username, password, project, domain)
         }
+    }
+}
+
+
+data class OpenstackObjects(val api: OSClient.OSClientV3, val verboseOutput: Boolean) {
+    private lateinit var healthMonitors: List<HealthMonitorV2>
+    private lateinit var pools: List<LbPoolV2>
+    private lateinit var networks: List<Network>
+    private lateinit var loadBalancers: List<LoadBalancerV2>
+    private lateinit var ports: List<Port>
+    private lateinit var subnets: List<Subnet>
+    private lateinit var listeners: List<ListenerV2>
+
+    fun collectData(stackName: String, internalNetwork: String) {
+        println("${Cli.blue}Gathering  Data${Cli.reset}")
+        this.networks = this.api.networking().network().list().filter { it.name.contains(internalNetwork) }
+        log("${Cli.red}Networks${Cli.reset}: $networks")
+        this.loadBalancers = this.api.networking().lbaasV2().loadbalancer().list().filter { it.name.contains(stackName) }
+        log("${Cli.red}Loadbalancers${Cli.reset}: $loadBalancers")
+        this.ports = findPorts()
+        log("${Cli.red}Ports${Cli.reset}: $ports")
+        this.subnets = findSubnets()
+        log("${Cli.red}Subnets${Cli.reset}: $subnets")
+        this.listeners = findListeners()
+        log("${Cli.red}Listeners${Cli.reset}: $listeners")
+        this.pools = findPools()
+        log("${Cli.red}Pools${Cli.reset}: ${pools}")
+        this.healthMonitors = findHealthMonitors()
+        log("${Cli.red}HealthMonitors${Cli.reset}: $healthMonitors")
+    }
+
+    fun transform() {
+        println("${Cli.blue}Modifying Data${Cli.reset}")
+        for (it in ports) {
+            if (it.deviceOwner == "network:router_interface") {
+                log("Resetting port owner of ${Cli.yellow}'network:router_interface'${Cli.reset}")
+                this.api.networking().port().update(it.toBuilder().deviceOwner("null_owner").build())
+            } else if (it.deviceOwner == "neutron:LOADBALANCERV2") {
+                log("Resetting port owner of ${Cli.yellow}'neutron:LOADBALANCERV2'${Cli.reset}")
+                this.api.networking().port().update(it.toBuilder().deviceOwner("null_owner").build())
+            }
+        }
+        this.ports = this.findPorts()
+    }
+
+    fun remove() {
+        println("${Cli.blue}Starting Removal${Cli.reset}")
+        log("Removing HealthMonitor")
+        this.healthMonitors.forEach {
+            log("Removing healthmonitor: $it")
+            checkedRemoval { this.api.networking().lbaasV2().healthMonitor().delete(it.id) }
+        }
+        log("Removing Pools")
+        this.pools.forEach {
+            log("Removing pool: $it")
+            checkedRemoval { this.api.networking().lbaasV2().lbPool().delete(it.id) }
+        }
+        log("Removing Subnets")
+        this.subnets.forEach {
+            log("Removing subnet: $it")
+            checkedRemoval { this.api.networking().subnet().delete(it.id) }
+        }
+        log("Removing Ports")
+        this.ports.forEach {
+            log("Removing port: $it")
+            checkedRemoval { this.api.networking().port().delete(it.id) }
+        }
+        log("Removing Listeners")
+        this.listeners.forEach {
+            log("Removing listener: $it")
+            checkedRemoval { this.api.networking().lbaasV2().listener().delete(it.id) }
+        }
+        log("Removing Loadbalancers")
+        this.loadBalancers.forEach {
+            log("Removing loadbalancer: $it")
+            checkedRemoval { this.api.networking().lbaasV2().loadbalancer().delete(it.id) }
+        }
+        log("Removing Networks")
+        this.networks.forEach {
+            log("Removing network: $it")
+            checkedRemoval { this.api.networking().network().delete(it.id) }
+        }
+    }
+
+    private fun findPorts(): List<Port> {
+        val ports = mutableListOf<Port>()
+        for (network in this.networks) {
+            val ps = this.api.networking().port().list().filter { it.networkId.equals(network.id) }
+            ports.addAll(ps)
+        }
+        return ports
+    }
+
+    private fun findSubnets(): List<Subnet> {
+        val subnets = mutableListOf<Subnet>()
+        for (network in this.networks) {
+            val sns = network.neutronSubnets
+            subnets.addAll(sns)
+        }
+        return subnets
+    }
+
+    private fun findHealthMonitors(): List<HealthMonitorV2> {
+        val healthMonitors = mutableListOf<HealthMonitorV2>()
+        for (pool in this.pools) {
+            val hms = this.api.networking().lbaasV2().healthMonitor().list().filter {
+                var result = false
+                for (hmPool in it.pools) {
+                    if (pool.id == hmPool.id) {
+                        result = true
+                        break
+                    }
+                }
+                result
+            }
+            healthMonitors.addAll(hms)
+        }
+        return healthMonitors.toList()
+    }
+
+    private fun findListeners(): List<ListenerV2> {
+        val listeners = mutableListOf<ListenerV2>()
+        for (loadBalancer in this.loadBalancers) {
+            val ls = loadBalancer.listeners
+            listeners.addAll(ls.map {
+                this.api.networking().lbaasV2().listener().get(it.id)
+            })
+        }
+        return listeners
+    }
+
+    private fun findPools(): List<LbPoolV2> {
+        val pools = mutableListOf<LbPoolV2>()
+        for (listener in this.listeners) {
+            val ps = this.api.networking().lbaasV2().lbPool().list().filter {
+                var result = false
+                // It seems that the pool objects do not compare via `equals`, so
+                // it.listeners.contains(listener) won't work
+                for (poolListener in it.listeners) {
+                    if (listener.id == poolListener.id) {
+                        result = true
+                        break
+                    }
+                }
+                result
+            }
+            pools.addAll(ps)
+        }
+        return pools.toList()
+    }
+
+    private fun checkedRemoval(removalFunction: () -> ActionResponse) {
+        val resp = removalFunction()
+        if (!resp.isSuccess) {
+            println("${Cli.red}Error during removal: ${resp.fault}${Cli.reset}")
+        }
+    }
+
+    private fun log(message: String) {
+        if (verboseOutput) println(message)
     }
 }
 
@@ -48,8 +207,10 @@ object Cli {
 
 
 class Skleaner : CliktCommand() {
-    val internalNet: String by argument(help = "name of the internal network in openstack")
-    val stackName: String by argument(help = "name of the stack in openstack")
+    val internalNet: String by argument(help = "value of the internal_net parameter")
+    val stackName: String by argument(help = "value of the stack_name parameter")
+    val dryRun: Boolean by option("--dry-run", "-d", help = "do not actually remove found objects").flag(default = false)
+    val verbose: Boolean by option("--verbose", "-V", help = "Verbose output").flag(default = false)
 
     override fun run() {
         val config = Configuration.fromEnvironment()
@@ -58,145 +219,15 @@ class Skleaner : CliktCommand() {
                 .credentials(config.username, config.password, Identifier.byName(config.domain))
                 .scopeToProject(Identifier.byId(config.project))
                 .authenticate()
-        println("${Cli.blue}Gathering  Data${Cli.reset}")
-        val networks = os.networking().network().list().filter { it.name.contains(internalNet) }
-        println("${Cli.red}Networks${Cli.reset}: $networks")
-        val loadBalancers = os.networking().lbaasV2().loadbalancer().list().filter { it.name.contains(stackName) }
-        println("${Cli.red}Loadbalancers${Cli.reset}: $loadBalancers")
-        var ports = findPorts(os, networks)
-        println("${Cli.red}Ports${Cli.reset}: $ports")
-        val subnets = findSubnets(networks)
-        println("${Cli.red}Subnets${Cli.reset}: $subnets")
-        val listeners = findListeners(os, loadBalancers)
-        println("${Cli.red}Listeners${Cli.reset}: $listeners")
-        val pools = findPools(os, listeners)
-        println("${Cli.red}Pools${Cli.reset}: ${pools}")
-        val healthMonitors = findHealthMonitors(pools, os)
-        println("${Cli.red}HealthMonitors${Cli.reset}: $healthMonitors")
 
-        transform(os, ports)
-        ports = findPorts(os, networks)
-
-        remove(os, healthMonitors, pools, subnets, listeners, ports, loadBalancers, networks)
-    }
-
-    private fun checkedRemoval(removalFunction: () -> ActionResponse) {
-        val resp = removalFunction()
-        if (!resp.isSuccess) {
-            println("${Cli.red}Error during removal: ${resp.fault}${Cli.reset}")
+        val data = OpenstackObjects(os, verbose)
+        data.collectData(this.stackName, this.internalNet)
+        if (!this.dryRun) {
+            data.transform()
+            data.remove()
+        } else {
+            println("${Cli.yellow}DRY RUN: Did not change openstack${Cli.reset}")
         }
-    }
-
-    private fun transform(os: OSClient.OSClientV3, ports: List<Port>) {
-        println("${Cli.blue}Modifying Data${Cli.reset}")
-        for (it in ports) {
-            if (it.deviceOwner == "network:router_interface") {
-                println("Resetting port owner of ${Cli.yellow}'network:router_interface'${Cli.reset}")
-                os.networking().port().update(it.toBuilder().deviceOwner("null_owner").build())
-            } else if (it.deviceOwner == "neutron:LOADBALANCERV2") {
-                println("Resetting port owner of ${Cli.yellow}'neutron:LOADBALANCERV2'${Cli.reset}")
-                os.networking().port().update(it.toBuilder().deviceOwner("null_owner").build())
-            }
-        }
-    }
-
-    private fun remove(os: OSClient.OSClientV3, hs: List<HealthMonitorV2>, ps: List<LbPoolV2>, sns: List<Subnet>, listeners: List<ListenerV2>, ports: List<Port>, lbs: List<LoadBalancerV2>, ns: List<Network>) {
-        println("${Cli.blue}Starting Removal${Cli.reset}")
-        println("Removing HealthMonitor")
-        hs.forEach {
-            checkedRemoval({ os.networking().lbaasV2().healthMonitor().delete(it.id) })
-        }
-        println("Removing Pools")
-        ps.forEach {
-            checkedRemoval { os.networking().lbaasV2().lbPool().delete(it.id) }
-        }
-        println("Removing Ports")
-        ports.forEach {
-            checkedRemoval { os.networking().port().delete(it.id) }
-        }
-        println("Removing Listeners")
-        listeners.forEach {
-            checkedRemoval { os.networking().lbaasV2().listener().delete(it.id) }
-        }
-        println("Removing Subnets")
-        sns.forEach {
-            checkedRemoval { os.networking().subnet().delete(it.id) }
-        }
-        println("Removing Loadbalancers")
-        lbs.forEach {
-            checkedRemoval { os.networking().lbaasV2().loadbalancer().delete(it.id) }
-        }
-        println("Removing Networks")
-        ns.forEach {
-            checkedRemoval { os.networking().network().delete(it.id) }
-        }
-    }
-
-    private fun findPorts(os: OSClient.OSClientV3, networks: List<Network>): List<Port> {
-        val ports = mutableListOf<Port>()
-        for (network in networks) {
-            val ps = os.networking().port().list().filter { it.networkId.equals(network.id) }
-            ports.addAll(ps)
-        }
-        return ports
-    }
-
-    private fun findSubnets(networks: List<Network>): List<Subnet> {
-        val subnets = mutableListOf<Subnet>()
-        for (network in networks) {
-            val sns = network.neutronSubnets
-            subnets.addAll(sns)
-        }
-        return subnets
-    }
-
-    private fun findHealthMonitors(pools: List<LbPoolV2>, os: OSClient.OSClientV3): List<HealthMonitorV2> {
-        val healthMonitors = mutableListOf<HealthMonitorV2>()
-        for (pool in pools) {
-            val hms = os.networking().lbaasV2().healthMonitor().list().filter {
-                var result = false
-                for (hmPool in it.pools) {
-                    if (pool.id == hmPool.id) {
-                        result = true
-                        break
-                    }
-                }
-                result
-            }
-            healthMonitors.addAll(hms)
-        }
-        return healthMonitors.toList()
-    }
-
-    private fun findListeners(os: OSClient.OSClientV3, loadBalancers: List<LoadBalancerV2>): List<ListenerV2> {
-        val listeners = mutableListOf<ListenerV2>()
-        for (loadBalancer in loadBalancers) {
-            val ls = loadBalancer.listeners
-            listeners.addAll(ls.map {
-                os.networking().lbaasV2().listener().get(it.id)
-            })
-        }
-        return listeners
-    }
-
-    private fun findPools(os: OSClient.OSClientV3, listeners: List<ListenerV2>): List<LbPoolV2> {
-        val pools = mutableListOf<LbPoolV2>()
-        for (listener in listeners) {
-            val ps = os.networking().lbaasV2().lbPool().list().filter {
-                var result = false
-                // It seems that the pool objects do not compare via `equals`, so
-                // it.listeners.contains(listener) won't work
-                for (poolListener in it.listeners) {
-                    if (listener.id == poolListener.id) {
-                        result = true
-                        break
-                    }
-                }
-                result
-            }
-            pools.addAll(ps)
-        }
-        return pools.toList()
     }
 }
 
