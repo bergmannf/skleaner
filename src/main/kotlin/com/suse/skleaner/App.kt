@@ -5,13 +5,17 @@ package com.suse.skleaner
 
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.parameters.arguments.argument
+import com.github.ajalt.clikt.parameters.arguments.optional
 import com.github.ajalt.clikt.parameters.options.flag
 import com.github.ajalt.clikt.parameters.options.option
 import org.openstack4j.api.OSClient
 import org.openstack4j.model.common.ActionResponse
 import org.openstack4j.model.common.Identifier
+import org.openstack4j.model.compute.SecGroupExtension
+import org.openstack4j.model.compute.Server
 import org.openstack4j.model.network.Network
 import org.openstack4j.model.network.Port
+import org.openstack4j.model.network.Router
 import org.openstack4j.model.network.Subnet
 import org.openstack4j.model.network.ext.HealthMonitorV2
 import org.openstack4j.model.network.ext.LbPoolV2
@@ -33,7 +37,10 @@ data class Configuration(val authUrl: String, val username: String, val password
 }
 
 
-data class OpenstackObjects(val api: OSClient.OSClientV3, val verboseOutput: Boolean) {
+class OpenstackObjects(private val api: OSClient.OSClientV3, private val verboseOutput: Boolean) {
+    private lateinit var securityGroups: List<SecGroupExtension>
+    private lateinit var machines: List<Server>
+    private lateinit var routers: List<Router>
     private lateinit var healthMonitors: List<HealthMonitorV2>
     private lateinit var pools: List<LbPoolV2>
     private lateinit var networks: List<Network>
@@ -42,7 +49,7 @@ data class OpenstackObjects(val api: OSClient.OSClientV3, val verboseOutput: Boo
     private lateinit var subnets: List<Subnet>
     private lateinit var listeners: List<ListenerV2>
 
-    fun collectData(stackName: String, internalNetwork: String) {
+    fun collectData(stackName: String, internalNetwork: String, internalRouter: String?) {
         println("${Cli.blue}Gathering  Data${Cli.reset}")
         this.networks = this.api.networking().network().list().filter { it.name.contains(internalNetwork) }
         log("${Cli.red}Networks${Cli.reset}: $networks")
@@ -55,9 +62,26 @@ data class OpenstackObjects(val api: OSClient.OSClientV3, val verboseOutput: Boo
         this.listeners = findListeners()
         log("${Cli.red}Listeners${Cli.reset}: $listeners")
         this.pools = findPools()
-        log("${Cli.red}Pools${Cli.reset}: ${pools}")
+        log("${Cli.red}Pools${Cli.reset}: $pools")
         this.healthMonitors = findHealthMonitors()
         log("${Cli.red}HealthMonitors${Cli.reset}: $healthMonitors")
+        this.machines = this.api.compute().servers().list().filter { it.name.contains(stackName) }
+        log("${Cli.red}Machines${Cli.reset}: $machines")
+        this.securityGroups = findSecurityGroups()
+        log("${Cli.red}SecurityGroups${Cli.reset}: $securityGroups")
+        if (!internalRouter.isNullOrBlank()) {
+            this.routers = this.api.networking().router().list().filter { it.name.contains(internalRouter) }
+            log("${Cli.red}Routers${Cli.reset}: $routers")
+        }
+    }
+
+    private fun findSecurityGroups(): List<SecGroupExtension> {
+        var securityGroups = mutableListOf<SecGroupExtension>()
+        for (machine in this.machines) {
+            val sgs = this.api.compute().securityGroups().listServerGroups(machine.id)
+            securityGroups.addAll(sgs)
+        }
+        return securityGroups.toList()
     }
 
     fun transform() {
@@ -76,6 +100,16 @@ data class OpenstackObjects(val api: OSClient.OSClientV3, val verboseOutput: Boo
 
     fun remove() {
         println("${Cli.blue}Starting Removal${Cli.reset}")
+        log("Removing machines")
+        this.machines.forEach {
+            log("Removing machine: $it")
+            checkedRemoval { this.api.compute().servers().delete(it.id) }
+        }
+        log("Removing security groups")
+        this.securityGroups.forEach {
+            log("Removing security group: $it")
+            checkedRemoval { this.api.compute().securityGroups().delete(it.id) }
+        }
         log("Removing HealthMonitor")
         this.healthMonitors.forEach {
             log("Removing healthmonitor: $it")
@@ -110,6 +144,11 @@ data class OpenstackObjects(val api: OSClient.OSClientV3, val verboseOutput: Boo
         this.networks.forEach {
             log("Removing network: $it")
             checkedRemoval { this.api.networking().network().delete(it.id) }
+        }
+        log("Removing Routers")
+        this.routers.forEach {
+            log("Removing router: $it")
+            checkedRemoval { this.api.networking().router().delete(it.id) }
         }
     }
 
@@ -209,6 +248,7 @@ object Cli {
 class Skleaner : CliktCommand() {
     val internalNet: String by argument(help = "value of the internal_net parameter")
     val stackName: String by argument(help = "value of the stack_name parameter")
+    val internalRouter: String? by argument(help = "value of the internal_router parameter").optional()
     val dryRun: Boolean by option("--dry-run", "-d", help = "do not actually remove found objects").flag(default = false)
     val verbose: Boolean by option("--verbose", "-V", help = "Verbose output").flag(default = false)
 
@@ -221,7 +261,7 @@ class Skleaner : CliktCommand() {
                 .authenticate()
 
         val data = OpenstackObjects(os, verbose)
-        data.collectData(this.stackName, this.internalNet)
+        data.collectData(this.stackName, this.internalNet, this.internalRouter)
         if (!this.dryRun) {
             data.transform()
             data.remove()
