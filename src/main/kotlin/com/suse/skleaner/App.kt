@@ -72,6 +72,8 @@ class OpenstackObjects(private val api: OSClient.OSClientV3, private val verbose
         if (!internalRouter.isNullOrBlank()) {
             this.routers = this.api.networking().router().list().filter { it.name.contains(internalRouter) }
             log("${Cli.red}Routers${Cli.reset}: $routers")
+        } else {
+          this.routers = listOf<Router>()
         }
     }
 
